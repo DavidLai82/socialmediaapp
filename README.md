@@ -2,6 +2,8 @@
 
 A sophisticated multi-agent AI platform for social media optimization using CrewAI, FastAPI, and Next.js.
 
+*A social media optimization app powered by AI agents for automated content creation, trend analysis, and cross-platform social media management.*
+
 ## 🚀 Features
 
 ### Multi-Agent System
@@ -33,8 +35,8 @@ Before setting up the application, ensure you have:
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repo-url>
-cd social-media-ai-app
+git clone https://github.com/DavidLai82/socialmediaapp.git
+cd socialmediaapp
 ```
 
 ### 2. Backend Setup
