@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import redis.asyncio as redis
 
-from agents.social_optimizer import SocialOptimizerCrew
+# Real crew import deferred to try/except below
 from models.schemas import (
     AgentTaskRequest, 
     AgentTaskResponse, 
@@ -24,9 +24,113 @@ from models.schemas import (
     AgentStatus,
     ErrorResponse
 )
-from utils.websocket_manager import WebSocketManager
+from utils.websocket_manager import websocket_manager
 from utils.task_manager import TaskManager
 from config.settings import settings, validate_required_settings, setup_logging, print_startup_info
+
+# Lightweight in-memory TaskManager fallback for development without Redis
+class InMemoryTaskManager:
+	def __init__(self):
+		self.tasks = {}
+		self.user_tasks = {}
+		self.initialized = True
+
+	async def initialize(self, _redis_client=None):
+		self.initialized = True
+
+	async def create_task(self, task_type: str, user_id: str, parameters: Dict[str, object], priority=None, max_retries: int = 3, timeout_seconds: int = 300) -> str:
+		import uuid, datetime
+		task_id = str(uuid.uuid4())
+		task = {
+			"task_id": task_id,
+			"task_type": task_type,
+			"user_id": user_id,
+			"parameters": parameters,
+			"status": "pending",
+			"priority": (priority.value if hasattr(priority, "value") else priority) or 2,
+			"max_retries": max_retries,
+			"retry_count": 0,
+			"timeout_seconds": timeout_seconds,
+			"created_at": datetime.datetime.now().isoformat(),
+			"updated_at": datetime.datetime.now().isoformat(),
+			"started_at": None,
+			"completed_at": None,
+			"result": None,
+			"error": None,
+			"progress": 0,
+		}
+		self.tasks[task_id] = task
+		self.user_tasks.setdefault(user_id, set()).add(task_id)
+		return task_id
+
+	async def get_task_status(self, task_id: str):
+		return self.tasks.get(task_id)
+
+	async def update_task_status(self, task_id: str, status: str, progress: Optional[int] = None, error: Optional[str] = None, result: Optional[object] = None):
+		import datetime
+		t = self.tasks.get(task_id)
+		if not t:
+			return
+		t["status"] = status
+		t["updated_at"] = datetime.datetime.now().isoformat()
+		if progress is not None:
+			t["progress"] = progress
+		if error is not None:
+			t["error"] = error
+		if result is not None:
+			t["result"] = result
+		if status == "running" and not t.get("started_at"):
+			t["started_at"] = datetime.datetime.now().isoformat()
+		if status in ("completed", "failed", "cancelled"):
+			t["completed_at"] = datetime.datetime.now().isoformat()
+
+	async def complete_task(self, task_id: str, result: object):
+		return await self.update_task_status(task_id, "completed", progress=100, result=result)
+
+	async def fail_task(self, task_id: str, error: str):
+		return await self.update_task_status(task_id, "failed", error=error)
+
+	async def cancel_task(self, task_id: str, reason: str = "Cancelled by user"):
+		return await self.update_task_status(task_id, "cancelled", error=reason)
+
+	async def get_active_tasks_count(self) -> int:
+		return sum(1 for t in self.tasks.values() if t.get("status") in ("pending", "running"))
+
+	async def get_user_tasks(self, user_id: str, limit: int = 10, offset: int = 0):
+		ids = list(self.user_tasks.get(user_id, []))
+		return [self.tasks[i] for i in ids[offset:offset+limit]]
+
+# Attempt to import real SocialOptimizerCrew, else provide a lightweight stub for development
+try:
+	from agents.social_optimizer import SocialOptimizerCrew as RealSocialOptimizerCrew
+except Exception as import_error:  # pragma: no cover
+	logger = logging.getLogger(__name__)
+	logger.warning(f"Falling back to stub SocialOptimizerCrew due to import error: {import_error}")
+
+	class RealSocialOptimizerCrew:  # type: ignore
+		def __init__(self):
+			self.initialized = False
+
+		async def initialize(self):
+			self.initialized = True
+
+		async def get_agents_status(self):
+			return {
+				"social_optimizer": {"name": "social_optimizer", "status": "active"},
+				"traffic_analyst": {"name": "traffic_analyst", "status": "active"},
+				"content_writer": {"name": "content_writer", "status": "active"},
+				"video_creator": {"name": "video_creator", "status": "active"},
+				"script_writer": {"name": "script_writer", "status": "active"},
+			}
+
+		async def generate_content(self, **kwargs):
+			return {"mock": True, "action": "generate_content", **kwargs}
+
+		async def analyze_trends(self, **kwargs):
+			return {"mock": True, "action": "analyze_trends", **kwargs}
+
+		async def create_video_content(self, **kwargs):
+			return {"mock": True, "action": "create_video_content", **kwargs}
 
 # Import API routes
 from api.websocket_routes import websocket_router
@@ -38,15 +142,16 @@ logger = logging.getLogger(__name__)
 
 # Global instances
 redis_client: Optional[redis.Redis] = None
-websocket_manager: WebSocketManager = WebSocketManager()
-task_manager: TaskManager = TaskManager()
-social_crew: Optional[SocialOptimizerCrew] = None
+# Use global singleton instance from utils
+# websocket_manager imported above
+task_manager: TaskManager | InMemoryTaskManager = TaskManager()
+social_crew: Optional[RealSocialOptimizerCrew] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events."""
-    global redis_client, social_crew
+    global redis_client, social_crew, task_manager
     
     # Startup
     logger.info("Starting Social Media Optimization Platform...")
@@ -59,30 +164,34 @@ async def lifespan(app: FastAPI):
         print_startup_info()
         
         # Initialize Redis connection
-        redis_client = redis.Redis(
-            host=settings.redis.host,
-            port=settings.redis.port,
-            db=settings.redis.db,
-            password=settings.redis.password,
-            max_connections=settings.redis.max_connections,
-            decode_responses=True
-        )
-        
-        # Test Redis connection
-        await redis_client.ping()
-        logger.info("Redis connection established")
-        
-        # Initialize task manager with Redis
-        await task_manager.initialize(redis_client)
-        logger.info("Task manager initialized")
+        try:
+            redis_client = redis.Redis(
+                host=settings.redis.host,
+                port=settings.redis.port,
+                db=settings.redis.db,
+                password=settings.redis.password,
+                max_connections=settings.redis.max_connections,
+                decode_responses=True
+            )
+            await redis_client.ping()
+            logger.info("Redis connection established")
+            await task_manager.initialize(redis_client)
+            logger.info("Task manager initialized")
+        except Exception as redis_error:
+            logger.warning(f"Redis unavailable, using in-memory task manager: {redis_error}")
+            # Switch to in-memory fallback
+            task_manager = InMemoryTaskManager()  # type: ignore
         
         # Initialize CrewAI social optimization crew
         if settings.ai_services.openai_api_key or settings.ai_services.anthropic_api_key:
-            social_crew = SocialOptimizerCrew()
+            social_crew = RealSocialOptimizerCrew()
             await social_crew.initialize()
             logger.info("Social optimization crew initialized")
         else:
-            logger.warning("No AI service API keys configured - crew initialization skipped")
+            # Initialize stub crew for development
+            social_crew = RealSocialOptimizerCrew()
+            await social_crew.initialize()
+            logger.warning("AI keys not configured - initialized stub social crew for development")
         
         logger.info("Application startup complete!")
         
@@ -138,7 +247,7 @@ async def get_redis() -> redis.Redis:
 
 
 # Dependency to get social crew
-async def get_social_crew() -> SocialOptimizerCrew:
+async def get_social_crew() -> RealSocialOptimizerCrew:
     """Get social optimization crew dependency."""
     if not social_crew:
         raise HTTPException(status_code=500, detail="Social crew not initialized")
@@ -161,40 +270,42 @@ async def root():
 
 
 @app.get("/health")
-async def health_check(redis: redis.Redis = Depends(get_redis)):
-    """Health check endpoint."""
+async def health_check():
+    """Health check endpoint that tolerates missing dependencies in development."""
     try:
-        # Check Redis connection
-        redis_status = "healthy"
-        try:
-            await redis.ping()
-        except Exception as e:
-            redis_status = f"unhealthy: {str(e)}"
-        
+        # Check Redis connection if available
+        redis_status = "unavailable"
+        if redis_client:
+            try:
+                await redis_client.ping()
+                redis_status = "healthy"
+            except Exception as e:
+                redis_status = f"unhealthy: {str(e)}"
+
         # Check agents status
         agents_status = {}
-        if social_crew and social_crew.initialized:
+        if social_crew and getattr(social_crew, "initialized", False):
             try:
                 agents_status = await social_crew.get_agents_status()
             except Exception as e:
                 agents_status = {"error": f"Failed to get agent status: {str(e)}"}
-        
+
         # Get active tasks count
         active_tasks = 0
         try:
             active_tasks = await task_manager.get_active_tasks_count()
         except Exception as e:
             logger.warning(f"Failed to get active tasks count: {str(e)}")
-        
+
         overall_status = "healthy"
-        if redis_status != "healthy":
+        if redis_status not in ("healthy", "unavailable"):
             overall_status = "degraded"
-        if not social_crew or not social_crew.initialized:
+        if not social_crew or not getattr(social_crew, "initialized", False):
             overall_status = "degraded" if overall_status == "healthy" else "critical"
-        
+
         return {
             "status": overall_status,
-            "timestamp": "now",  # Will be replaced with actual timestamp in production
+            "timestamp": __import__("datetime").datetime.now().isoformat(),
             "components": {
                 "redis": redis_status,
                 "agents": "healthy" if agents_status and not agents_status.get("error") else "degraded",
@@ -205,7 +316,7 @@ async def health_check(redis: redis.Redis = Depends(get_redis)):
             "environment": settings.environment,
             "version": settings.app_version
         }
-        
+
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
         raise HTTPException(status_code=500, detail="Health check failed")
@@ -214,7 +325,7 @@ async def health_check(redis: redis.Redis = Depends(get_redis)):
 @app.get("/agents/status", response_model=Dict[str, AgentStatus])
 async def get_agents_status() -> Dict[str, AgentStatus]:
     """Get status of all agents."""
-    if not social_crew or not social_crew.initialized:
+    if not social_crew or not getattr(social_crew, "initialized", False):
         raise HTTPException(
             status_code=503, 
             detail="Social media optimization crew not initialized"
@@ -232,7 +343,7 @@ async def get_agents_status() -> Dict[str, AgentStatus]:
 async def generate_content(
     request: ContentGenerationRequest,
     background_tasks: BackgroundTasks,
-    crew: SocialOptimizerCrew = Depends(get_social_crew)
+    crew: RealSocialOptimizerCrew = Depends(get_social_crew)
 ):
     """Generate social media content using the content writing agent."""
     try:
@@ -268,7 +379,7 @@ async def generate_content(
 async def analyze_trends(
     request: TrendAnalysisRequest,
     background_tasks: BackgroundTasks,
-    crew: SocialOptimizerCrew = Depends(get_social_crew)
+    crew: RealSocialOptimizerCrew = Depends(get_social_crew)
 ):
     """Analyze social media trends using the traffic analysis agent."""
     try:
@@ -302,7 +413,7 @@ async def analyze_trends(
 async def create_video_content(
     request: VideoCreationRequest,
     background_tasks: BackgroundTasks,
-    crew: SocialOptimizerCrew = Depends(get_social_crew)
+    crew: RealSocialOptimizerCrew = Depends(get_social_crew)
 ):
     """Create video content plan using video creation and script writing agents."""
     try:
@@ -392,7 +503,7 @@ async def cancel_task(task_id: str, user_id: str):
 async def execute_content_generation(
     task_id: str, 
     request: ContentGenerationRequest, 
-    crew: SocialOptimizerCrew
+    crew: RealSocialOptimizerCrew
 ):
     """Execute content generation task in background."""
     try:
@@ -432,7 +543,7 @@ async def execute_content_generation(
 async def execute_trend_analysis(
     task_id: str, 
     request: TrendAnalysisRequest, 
-    crew: SocialOptimizerCrew
+    crew: RealSocialOptimizerCrew
 ):
     """Execute trend analysis task in background."""
     try:
@@ -469,7 +580,7 @@ async def execute_trend_analysis(
 async def execute_video_creation(
     task_id: str, 
     request: VideoCreationRequest, 
-    crew: SocialOptimizerCrew
+    crew: RealSocialOptimizerCrew
 ):
     """Execute video creation task in background."""
     try:

@@ -7,7 +7,7 @@ import json
 from typing import Dict, Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
 from fastapi.websockets import WebSocketState
-from ..utils.websocket_manager import WebSocketManager
+from utils.websocket_manager import websocket_manager
 
 logger = logging.getLogger(__name__)
 
@@ -17,8 +17,8 @@ websocket_router = APIRouter(
     tags=["websocket"]
 )
 
-# WebSocket manager instance
-websocket_manager = WebSocketManager()
+# Use global WebSocket manager instance from utils
+# websocket_manager is imported from utils.websocket_manager
 
 
 @websocket_router.websocket("/connect/{user_id}")
@@ -85,6 +85,16 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         logger.info(f"WebSocket connection closed for user: {user_id}")
 
 
+@websocket_router.websocket("/connect")
+async def websocket_endpoint_query(websocket: WebSocket):
+	"""Alternate WebSocket endpoint supporting user_id as query parameter."""
+	user_id = websocket.query_params.get("user_id")
+	if not user_id:
+		await websocket.close(code=1008)
+		return
+	return await websocket_endpoint(websocket, user_id)
+
+
 async def handle_websocket_message(user_id: str, message: Dict[str, Any]):
     """Handle incoming WebSocket messages from clients."""
     
@@ -115,9 +125,9 @@ async def handle_websocket_message(user_id: str, message: Dict[str, Any]):
                     }
                 )
                 
-        elif message_type == "subscribe_to_updates":
-            # Client wants to subscribe to specific updates
-            subscription_type = message.get("subscription_type", "all")
+        elif message_type in ("subscribe_to_updates", "subscribe"):
+            # Client wants to subscribe to specific updates (supports legacy 'subscribe')
+            subscription_type = message.get("subscription_type") or message.get("subscription") or "all"
             await handle_subscription_request(user_id, subscription_type)
             
         elif message_type == "agent_status_request":
