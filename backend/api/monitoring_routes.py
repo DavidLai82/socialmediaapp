@@ -129,7 +129,7 @@ async def get_agent_monitoring():
     """Get detailed agent system monitoring information."""
     
     try:
-        from ..agents.social_optimizer import SocialOptimizerCrew
+        from agents.social_optimizer import SocialOptimizerCrew
         
         # Initialize crew if not already done
         social_crew = SocialOptimizerCrew()
@@ -179,7 +179,7 @@ async def get_task_analytics(
     """Get task execution analytics and performance metrics."""
     
     try:
-        from ..utils.task_manager import TaskManager
+        from utils.task_manager import TaskManager
         
         task_manager = TaskManager()
         

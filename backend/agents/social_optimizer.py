@@ -11,7 +11,7 @@ from crewai.tools import BaseTool
 import os
 from dotenv import load_dotenv
 
-from ..utils.task_manager import TaskManager
+from utils.task_manager import TaskManager
 from .content_tools import ContentGenerationTool
 from .social_media_tools import SocialMediaAnalysisTool
 from .video_tools import VideoCreationTool

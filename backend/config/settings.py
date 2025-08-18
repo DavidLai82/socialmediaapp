@@ -4,7 +4,8 @@ Application configuration and settings management
 
 import os
 from typing import List, Optional
-from pydantic import BaseSettings, Field, validator
+from pydantic_settings import BaseSettings
+from pydantic import Field, validator
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -122,28 +123,27 @@ class SocialMediaSettings(BaseSettings):
 
 
 class SecuritySettings(BaseSettings):
-    """Security configuration settings."""
+	"""Security configuration settings."""
+	secret_key: str = Field(default="dev-secret-key", env="SECRET_KEY")
+	jwt_secret_key: str = Field(default="dev-jwt-secret-key", env="JWT_SECRET_KEY")
+	jwt_algorithm: str = Field(default="HS256", env="JWT_ALGORITHM")
+	access_token_expire_minutes: int = Field(default=30, env="ACCESS_TOKEN_EXPIRE_MINUTES")
+	refresh_token_expire_days: int = Field(default=7, env="REFRESH_TOKEN_EXPIRE_DAYS")
     
-    secret_key: str = Field(..., env="SECRET_KEY")
-    jwt_secret_key: str = Field(..., env="JWT_SECRET_KEY")
-    jwt_algorithm: str = Field(default="HS256", env="JWT_ALGORITHM")
-    access_token_expire_minutes: int = Field(default=30, env="ACCESS_TOKEN_EXPIRE_MINUTES")
-    refresh_token_expire_days: int = Field(default=7, env="REFRESH_TOKEN_EXPIRE_DAYS")
-    
-    # Password settings
-    min_password_length: int = Field(default=8, env="MIN_PASSWORD_LENGTH")
-    max_password_length: int = Field(default=128, env="MAX_PASSWORD_LENGTH")
-    require_special_chars: bool = Field(default=True, env="REQUIRE_SPECIAL_CHARS")
-    require_numbers: bool = Field(default=True, env="REQUIRE_NUMBERS")
-    require_uppercase: bool = Field(default=True, env="REQUIRE_UPPERCASE")
-    
-    # Rate limiting
-    rate_limit_per_minute: int = Field(default=100, env="RATE_LIMIT_PER_MINUTE")
-    rate_limit_burst: int = Field(default=200, env="RATE_LIMIT_BURST")
-    
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+	# Password settings
+	min_password_length: int = Field(default=8, env="MIN_PASSWORD_LENGTH")
+	max_password_length: int = Field(default=128, env="MAX_PASSWORD_LENGTH")
+	require_special_chars: bool = Field(default=True, env="REQUIRE_SPECIAL_CHARS")
+	require_numbers: bool = Field(default=True, env="REQUIRE_NUMBERS")
+	require_uppercase: bool = Field(default=True, env="REQUIRE_UPPERCASE")
+	
+	# Rate limiting
+	rate_limit_per_minute: int = Field(default=100, env="RATE_LIMIT_PER_MINUTE")
+	rate_limit_burst: int = Field(default=200, env="RATE_LIMIT_BURST")
+	
+	class Config:
+		env_file = ".env"
+		case_sensitive = False
 
 
 class ServerSettings(BaseSettings):
@@ -317,16 +317,16 @@ def validate_required_settings():
     
     errors = []
     
-    # Check required security settings
-    if not settings.security.secret_key:
-        errors.append("SECRET_KEY is required")
+    # Check required security settings (enforced in production only)
+    if settings.is_production:
+        if not settings.security.secret_key:
+            errors.append("SECRET_KEY is required in production")
+        if not settings.security.jwt_secret_key:
+            errors.append("JWT_SECRET_KEY is required in production")
     
-    if not settings.security.jwt_secret_key:
-        errors.append("JWT_SECRET_KEY is required")
-    
-    # Check AI service settings
-    if not settings.ai_services.openai_api_key and not settings.ai_services.anthropic_api_key:
-        errors.append("At least one AI service API key (OpenAI or Anthropic) is required")
+    # Check AI service settings (required only in production)
+    if settings.is_production and not (settings.ai_services.openai_api_key or settings.ai_services.anthropic_api_key):
+        errors.append("At least one AI service API key (OpenAI or Anthropic) is required in production")
     
     # Check database settings
     if not settings.database.user or not settings.database.password:
